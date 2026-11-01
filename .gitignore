@@ -1,0 +1,19 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyInstaller / Build outputs
+build/
+dist/
+*.spec
+
+# Configuration and user data (nếu không muốn commit lịch sử bôi đen)
+history.json
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/

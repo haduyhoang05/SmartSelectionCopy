@@ -1,0 +1,10 @@
+uiautomation>=2.0.20
+pynput>=1.7.6
+comtypes>=1.2.0
+pytesseract>=0.3.10
+Pillow>=9.5.0
+pystray>=0.19.5
+winocr>=0.0.15
+customtkinter>=5.2.0
+darkdetect>=0.8.0
+pyinstaller>=6.0.0
