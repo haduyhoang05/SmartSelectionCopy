@@ -8,13 +8,90 @@ Cải tiến:
 4. Quản lý hàng đợi và luồng worker UIA an toàn (Thread-safe COM).
 """
 
+import os
 import math
 import time
 import queue
 import threading
+import ctypes
+from ctypes import wintypes
 from pynput import mouse, keyboard
 import uiautomation as auto
 import comtypes
+
+# Cấu hình Win32 API clipboard và bàn phím an toàn
+user32 = ctypes.windll.user32
+kernel32 = ctypes.windll.kernel32
+
+kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+kernel32.GlobalLock.restype = ctypes.c_void_p
+kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+
+user32.GetClipboardData.restype = wintypes.HANDLE
+user32.GetClipboardData.argtypes = [wintypes.UINT]
+user32.SetClipboardData.restype = wintypes.HANDLE
+user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+
+CF_UNICODETEXT = 13
+SENTINEL_CLIP = "\x00__SMART_SELECTION_CLIP_SENTINEL__\x00"
+
+def _win32_get_clipboard_text():
+    """Đọc văn bản từ bộ nhớ tạm Win32 an toàn đa luồng."""
+    for _ in range(5):
+        if user32.OpenClipboard(0):
+            break
+        kernel32.Sleep(10)
+    else:
+        return ""
+    try:
+        h = user32.GetClipboardData(CF_UNICODETEXT)
+        if not h:
+            return ""
+        p = kernel32.GlobalLock(h)
+        if not p:
+            return ""
+        try:
+            return ctypes.c_wchar_p(p).value or ""
+        finally:
+            kernel32.GlobalUnlock(h)
+    finally:
+        user32.CloseClipboard()
+
+def _win32_set_clipboard_text(text):
+    """Ghi văn bản Unicode vào bộ nhớ tạm Win32."""
+    for _ in range(5):
+        if user32.OpenClipboard(0):
+            break
+        kernel32.Sleep(10)
+    else:
+        return False
+    try:
+        user32.EmptyClipboard()
+        if text:
+            encoded = text.encode('utf-16le') + b'\x00\x00'
+            h = kernel32.GlobalAlloc(0x0002, len(encoded))
+            if h:
+                p = kernel32.GlobalLock(h)
+                if p:
+                    ctypes.memmove(p, encoded, len(encoded))
+                    kernel32.GlobalUnlock(h)
+                    user32.SetClipboardData(CF_UNICODETEXT, h)
+        return True
+    finally:
+        user32.CloseClipboard()
+
+def _simulate_ctrl_c():
+    """Gửi tín hiệu phím Ctrl + C tức thời để sao chép văn bản đã chọn."""
+    VK_CONTROL = 0x11
+    VK_C = 0x43
+    KEYEVENTF_KEYUP = 0x0002
+    user32.keybd_event(VK_CONTROL, 0, 0, 0)
+    user32.keybd_event(VK_C, 0, 0, 0)
+    time.sleep(0.02)
+    user32.keybd_event(VK_C, 0, KEYEVENTF_KEYUP, 0)
+    user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
 
 class SelectionReader:
     """
@@ -30,6 +107,7 @@ class SelectionReader:
         self.keyboard_listener = None
         self.is_running = False
         self.enabled = True
+        self.auto_copy = False
 
         # Theo dõi chuột
         self.start_x = 0
@@ -88,6 +166,10 @@ class SelectionReader:
         """Bật/tắt việc tiếp nhận sự kiện."""
         self.enabled = enabled
 
+    def set_auto_copy(self, auto_copy):
+        """Cập nhật cờ tự động sao chép để xử lý bộ nhớ tạm."""
+        self.auto_copy = auto_copy
+
     def _on_click(self, x, y, button, pressed):
         if not self.enabled:
             return
@@ -103,7 +185,6 @@ class SelectionReader:
                 duration = now - self.press_time
 
                 # 1. Kéo rê bôi đen hợp lệ: Khoảng cách > 12px và thời gian nhấn giữ > 70ms
-                # Tránh tình trạng nhấp chuột thường nhưng tay hơi rung
                 is_drag = (dist > 12) and (duration > 0.07)
 
                 # 2. Nhấp đúp / nhấp 3 lần để chọn từ hoặc đoạn văn
@@ -111,8 +192,9 @@ class SelectionReader:
                 self.last_release_time = now
 
                 if is_drag or is_multi_click:
-                    # Gửi cờ kiểm tra kèm loại thao tác
-                    self.task_queue.put(("CHECK_SELECTION", is_drag))
+                    # Gửi cờ kiểm tra kèm tọa độ vùng bôi đen (start_x, start_y, end_x, end_y)
+                    bounds = (self.start_x, self.start_y, x, y)
+                    self.task_queue.put(("CHECK_SELECTION", (True, bounds)))
 
     def _on_press(self, key):
         if not self.enabled:
@@ -143,7 +225,9 @@ class SelectionReader:
 
         # Shift + mũi tên / home / end
         if is_nav_key and has_shift:
-            self.task_queue.put(("CHECK_SELECTION", True))
+            pt = wintypes.POINT()
+            user32.GetCursorPos(ctypes.byref(pt))
+            self.task_queue.put(("CHECK_SELECTION", (True, (pt.x, pt.y, pt.x, pt.y))))
 
         # Ctrl + A
         is_a_key = False
@@ -153,7 +237,9 @@ class SelectionReader:
             is_a_key = True
 
         if is_a_key and has_ctrl:
-            self.task_queue.put(("CHECK_SELECTION", True))
+            pt = wintypes.POINT()
+            user32.GetCursorPos(ctypes.byref(pt))
+            self.task_queue.put(("CHECK_SELECTION", (True, (pt.x, pt.y, pt.x, pt.y))))
 
     def _worker_loop(self):
         try:
@@ -170,7 +256,11 @@ class SelectionReader:
             if task is None:
                 break
 
-            task_type, is_drag = task
+            task_type, payload = task
+            if isinstance(payload, tuple):
+                is_drag, bounds = payload
+            else:
+                is_drag, bounds = payload, None
 
             # Lọc bỏ các yêu cầu trùng lặp dồn ứ trong queue
             while not self.task_queue.empty():
@@ -179,13 +269,41 @@ class SelectionReader:
                 except queue.Empty:
                     break
 
-            # Chờ 120ms để ứng dụng nguồn cập nhật trạng thái lựa chọn
-            time.sleep(0.12)
+            # Tối ưu siêu tốc: chỉ cần chờ 35ms để ứng dụng cập nhật lựa chọn
+            time.sleep(0.035)
 
             try:
+                # Bỏ qua nếu thao tác diễn ra trong chính cửa sổ ứng dụng này
+                fg_hwnd = user32.GetForegroundWindow()
+                if fg_hwnd:
+                    fg_pid = wintypes.DWORD()
+                    user32.GetWindowThreadProcessId(fg_hwnd, ctypes.byref(fg_pid))
+                    if fg_pid.value == os.getpid():
+                        continue
+
                 text, is_protected = self._query_selected_text()
+
+                # Fallback mạnh mẽ cho file PDF (Chrome, Edge, Adobe Reader, Foxit...)
+                # Khi UIA TextPattern không hỗ trợ, sử dụng mô phỏng Ctrl+C với kiểm tra sentinel
+                if not text and is_drag:
+                    clip_text = self._query_selected_via_clipboard()
+                    if clip_text:
+                        text = clip_text
+                        is_protected = False
+
                 if text or is_protected:
-                    self.callback(text, is_protected)
+                    if not bounds:
+                        try:
+                            pt = wintypes.POINT()
+                            user32.GetCursorPos(ctypes.byref(pt))
+                            bounds = (pt.x, pt.y, pt.x, pt.y)
+                        except Exception:
+                            bounds = (0, 0, 0, 0)
+
+                    try:
+                        self.callback(text, is_protected, bounds)
+                    except TypeError:
+                        self.callback(text, is_protected)
             except Exception:
                 pass
 
@@ -193,6 +311,43 @@ class SelectionReader:
             comtypes.CoUninitialize()
         except Exception:
             pass
+
+    def _query_selected_via_clipboard(self):
+        """
+        Trích xuất văn bản bôi đen qua mô phỏng Ctrl+C khi UIA không đọc được
+        (đặc biệt hiệu quả cho file PDF trên Chrome, Edge, Adobe Acrobat, Foxit...).
+        """
+        try:
+            fg_hwnd = user32.GetForegroundWindow()
+            if fg_hwnd:
+                fg_pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(fg_hwnd, ctypes.byref(fg_pid))
+                if fg_pid.value == os.getpid():
+                    return ""
+
+            old_clip = _win32_get_clipboard_text()
+            _win32_set_clipboard_text(SENTINEL_CLIP)
+
+            _simulate_ctrl_c()
+
+            new_text = ""
+            for _ in range(5):
+                time.sleep(0.012)
+                clip = _win32_get_clipboard_text()
+                if clip and clip != SENTINEL_CLIP:
+                    new_text = clip
+                    break
+
+            if new_text and new_text != SENTINEL_CLIP:
+                # Nếu không bật auto_copy, khôi phục lại clipboard cũ của người dùng
+                if not self.auto_copy:
+                    _win32_set_clipboard_text(old_clip)
+                return new_text.strip()
+            else:
+                _win32_set_clipboard_text(old_clip)
+                return ""
+        except Exception:
+            return ""
 
     def _query_selected_text(self):
         """

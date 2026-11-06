@@ -14,6 +14,7 @@ import customtkinter as ctk
 
 from utils import clean_text_linebreaks, clean_whitespace, translate_text, speak_text_async
 from config import save_config, load_history, save_history
+from floating_widget import FloatingTranslateManager
 
 # Cài đặt giao diện CustomTkinter chuẩn Dark Mode
 ctk.set_appearance_mode("Dark")
@@ -73,7 +74,11 @@ class SelectionAppUI(ctk.CTk):
         self.append_mode_var = ctk.BooleanVar(value=self.config_data.get("append_mode", False))
         self.clean_linebreaks_var = ctk.BooleanVar(value=self.config_data.get("clean_linebreaks", True))
         self.minimize_to_tray_var = ctk.BooleanVar(value=self.config_data.get("minimize_to_tray", True))
+        self.floating_translate_var = ctk.BooleanVar(value=self.config_data.get("floating_translate_enabled", True))
         self.ocr_engine_var = ctk.StringVar(value=self.config_data.get("ocr_engine", "auto"))
+
+        # Trình quản lý biểu tượng dịch nổi và popup
+        self.floating_manager = FloatingTranslateManager(self)
 
         # Lưu bản gốc gần nhất trước khi dịch
         self.last_original_text = ""
@@ -93,8 +98,8 @@ class SelectionAppUI(ctk.CTk):
         # Bắt sự kiện đóng cửa sổ
         self.protocol("WM_DELETE_WINDOW", self._on_close_requested)
 
-        # Lắng nghe hàng đợi thông điệp
-        self.after(50, self._poll_queue)
+        # Lắng nghe hàng đợi thông điệp siêu tốc (20ms)
+        self.after(20, self._poll_queue)
 
     def _set_window_icon(self):
         candidates = [
@@ -497,6 +502,11 @@ class SelectionAppUI(ctk.CTk):
             variable=self.minimize_to_tray_var, font=sub_font, progress_color=self.palette["accent_blue"]
         ).pack(anchor="w", pady=6)
 
+        ctk.CTkSwitch(
+            container, text="Hiện biểu tượng dịch nổi 🌐 (Floating Icon) khi tắt/ẩn cửa sổ",
+            variable=self.floating_translate_var, font=sub_font, progress_color=self.palette["accent_purple"]
+        ).pack(anchor="w", pady=6)
+
         # Nút lưu cài đặt
         ctk.CTkButton(
             container,
@@ -533,6 +543,10 @@ class SelectionAppUI(ctk.CTk):
         else:
             self.set_status("Đã tạm dừng tự động bắt UIA. Bạn vẫn quét OCR bình thường.", "#f59e0b")
 
+    def set_reader(self, reader):
+        """Liên kết SelectionReader với UI."""
+        self.reader = reader
+
     def _save_quick_settings(self):
         self.config_data["always_on_top"] = self.always_on_top_var.get()
         self.config_data["auto_capture"] = self.auto_capture_var.get()
@@ -540,6 +554,8 @@ class SelectionAppUI(ctk.CTk):
         self.config_data["auto_translate"] = self.auto_translate_var.get()
         self.config_data["append_mode"] = self.append_mode_var.get()
         save_config(self.config_data)
+        if hasattr(self, "reader") and self.reader:
+            self.reader.set_auto_copy(self.auto_copy_var.get())
 
     def _save_all_settings(self):
         self.config_data["always_on_top"] = self.always_on_top_var.get()
@@ -549,11 +565,29 @@ class SelectionAppUI(ctk.CTk):
         self.config_data["append_mode"] = self.append_mode_var.get()
         self.config_data["clean_linebreaks"] = self.clean_linebreaks_var.get()
         self.config_data["minimize_to_tray"] = self.minimize_to_tray_var.get()
+        self.config_data["floating_translate_enabled"] = self.floating_translate_var.get()
         self.config_data["ocr_engine"] = self.ocr_engine_var.get()
         self.config_data["hotkey_ocr"] = self.entry_hotkey.get().strip() or "<alt>+q"
         save_config(self.config_data)
+        if hasattr(self, "reader") and self.reader:
+            self.reader.set_auto_copy(self.auto_copy_var.get())
         self.set_status("Đã lưu cấu hình thành công!", "#10b981")
         messagebox.showinfo("Cài đặt", "Đã lưu cài đặt thành công!")
+
+    def add_history_entry(self, source, text):
+        """Thêm một mục vào danh sách lịch sử và làm mới UI."""
+        if not text or not text.strip():
+            return
+        entry = {
+            "time": time.strftime("%H:%M:%S"),
+            "source": source,
+            "text": text.strip()
+        }
+        self.history_items.insert(0, entry)
+        limit = self.config_data.get("history_limit", 50)
+        self.history_items = self.history_items[:limit]
+        save_history(self.history_items, limit)
+        self._refresh_history_ui()
 
     def set_status(self, message, dot_color="#10b981"):
         self.status_dot.configure(text_color=dot_color)
@@ -801,17 +835,31 @@ class SelectionAppUI(ctk.CTk):
         except queue.Empty:
             pass
         finally:
-            self.after(50, self._poll_queue)
+            self.after(20, self._poll_queue)
 
     def _handle_queue_msg(self, task_type, data):
         if task_type == "UIA_EVENT":
-            text, is_protected = data
+            # Hỗ trợ nhận diện (text, is_protected, bounds)
+            text = data[0] if len(data) > 0 else ""
+            is_protected = data[1] if len(data) > 1 else False
+            bounds = data[2] if len(data) > 2 else None
+
             if not self.auto_capture_var.get():
                 return
+
+            is_hidden = not self.winfo_viewable() or self.state() in ("withdrawn", "iconic")
+
             if text and text.strip():
-                self.update_text(text, source="UIA")
+                # Khi tắt/ẩn cửa sổ tool, nếu bật tính năng thì xuất hiện icon dịch nổi
+                if is_hidden and self.floating_translate_var.get():
+                    self.floating_manager.show_icon(text, bounds)
+                    # Cập nhật ô văn bản và lịch sử chạy ngầm
+                    self.update_text(text, source="UIA")
+                else:
+                    self.update_text(text, source="UIA")
             elif is_protected:
-                self.set_status("Ứng dụng này chặn đọc trực tiếp. Nhấn Alt + Q để quét OCR.", "#f59e0b")
+                if not is_hidden:
+                    self.set_status("Ứng dụng này chặn đọc trực tiếp. Nhấn Alt + Q để quét OCR.", "#f59e0b")
 
         elif task_type == "OCR_RESULT":
             text, engine_used, error = data
@@ -844,6 +892,10 @@ class SelectionAppUI(ctk.CTk):
             else:
                 self.set_status(f"{translated}", "#ef4444")
 
+        elif task_type == "FLOATING_TRANSLATE_DONE":
+            trans_text, src_lang, tgt_lang = data
+            self.floating_manager._on_translation_finished(trans_text, src_lang, tgt_lang)
+
     def get_msg_queue(self):
         return self.msg_queue
 
@@ -855,6 +907,11 @@ class SelectionAppUI(ctk.CTk):
             self._exit_app()
 
     def _exit_app(self):
+        try:
+            self.floating_manager.cleanup()
+        except Exception:
+            pass
+
         try:
             self.config_data["window_geometry"] = self.geometry()
             save_config(self.config_data)

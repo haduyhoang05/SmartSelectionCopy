@@ -39,10 +39,10 @@ def main():
     tray = None
     hotkey_listener = None
 
-    def on_selection_received(text, is_protected):
+    def on_selection_received(text, is_protected, cursor_pos=None):
         """Callback từ SelectionReader gửi tới UI."""
         if app:
-            app.get_msg_queue().put(("UIA_EVENT", (text, is_protected)))
+            app.get_msg_queue().put(("UIA_EVENT", (text, is_protected, cursor_pos)))
 
     def on_crop_finished(image):
         """Callback sau khi kéo chọn chụp màn hình kết thúc."""
@@ -126,7 +126,9 @@ def main():
 
         # Khởi tạo SelectionReader
         reader = SelectionReader(on_selection_received)
+        reader.set_auto_copy(config.get("auto_copy", False))
         reader.start()
+        app.set_reader(reader)
 
         # Khởi tạo System Tray
         tray = SystemTrayManager(

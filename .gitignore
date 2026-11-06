@@ -8,8 +8,9 @@ build/
 dist/
 *.spec
 
-# Configuration and user data (nếu không muốn commit lịch sử bôi đen)
+# Configuration and user data
 history.json
+config.json
 
 # Environments
 .env

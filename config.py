@@ -16,6 +16,7 @@ DEFAULT_CONFIG = {
     "append_mode": False,
     "clean_linebreaks": True,
     "minimize_to_tray": True,
+    "floating_translate_enabled": True,
     "hotkey_ocr": "<alt>+q",
     "ocr_engine": "auto",  # "auto", "winocr", "tesseract"
     "history_limit": 50,

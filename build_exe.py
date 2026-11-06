@@ -52,6 +52,7 @@ def build():
         "--hidden-import=uiautomation",
         "--hidden-import=comtypes",
         "--hidden-import=comtypes.client",
+        "--hidden-import=floating_widget",
         "--hidden-import=winocr",
         "--hidden-import=winrt",
         "--hidden-import=winrt.windows.media.ocr",
